@@ -37,12 +37,12 @@ var objectTypes = map[string]string{
 func resourcePostgreSQLGrant() *schema.Resource {
 	return &schema.Resource{
 		Create: PGResourceFunc(resourcePostgreSQLGrantCreate),
-		// Since all of this resource's arguments force a recreation
-		// there's no need for an Update function
-		// Update:
+		Update: PGResourceFunc(resourcePostgreSQLGrantUpdate),
 		Read:   PGResourceFunc(resourcePostgreSQLGrantRead),
 		Delete: PGResourceFunc(resourcePostgreSQLGrantDelete),
-
+		Importer: &schema.ResourceImporter{
+			StateContext: schema.ImportStatePassthroughContext,
+		},
 		Schema: map[string]*schema.Schema{
 			"role": {
 				Type:        schema.TypeString,
@@ -88,7 +88,7 @@ func resourcePostgreSQLGrant() *schema.Resource {
 			"privileges": {
 				Type:        schema.TypeSet,
 				Required:    true,
-				ForceNew:    true,
+				ForceNew:    false,
 				Elem:        &schema.Schema{Type: schema.TypeString},
 				Set:         schema.HashString,
 				Description: "The list of privileges to grant",
@@ -109,15 +109,29 @@ func resourcePostgreSQLGrantRead(db *DBConnection, d *schema.ResourceData) error
 		return fmt.Errorf("feature is not supported: %v", err)
 	}
 
+	roleId := d.Id()
+
 	exists, err := checkRoleDBSchemaExists(db.client, d)
 	if err != nil {
 		return err
 	}
 	if !exists {
-		d.SetId("")
-		return nil
+		role, database, objectType, schema, objects, columns, err := parseInput(roleId)
+		if err != nil {
+			return err
+		}
+		d.Set("role", role)
+		d.Set("database", database)
+		d.Set("schema", schema)
+		d.Set("object_type", objectType)
+		d.Set("objects", objects)
+		d.Set("columns", columns)
+		d.Set("with_grant_option", false)
+		id := generateGrantIDImpl(role, database, objectType, schema, objects, columns)
+		d.SetId(id)
+	} else {
+		d.SetId(generateGrantID(d))
 	}
-	d.SetId(generateGrantID(d))
 
 	txn, err := startTransaction(db.client, d.Get("database").(string))
 	if err != nil {
@@ -211,6 +225,32 @@ func resourcePostgreSQLGrantCreate(db *DBConnection, d *schema.ResourceData) err
 	defer deferredRollback(txn)
 
 	return readRolePrivileges(txn, d)
+}
+
+func parseInput(input string) (role, database, objectType, schemaName string, objects, columns *schema.Set, err error) {
+	parts := strings.Split(input, ".")
+	if len(parts) != 6 {
+		return "", "", "", "", nil, nil, fmt.Errorf("input does not contain exactly 5 dots")
+	}
+
+	return parts[0], parts[1], parts[2], parts[3], parseToSet(parts[4]), parseToSet(parts[5]), nil
+}
+
+func parseToSet(part string) *schema.Set {
+	if part == "" {
+		return schema.NewSet(schema.HashString, []interface{}{})
+	}
+	// Splitting the part by a comma, assuming multiple objects or columns could be separated by commas
+	items := strings.Split(part, ",")
+	var interfaces []interface{}
+	for _, item := range items {
+		interfaces = append(interfaces, item)
+	}
+	return schema.NewSet(schema.HashString, interfaces)
+}
+
+func resourcePostgreSQLGrantUpdate(db *DBConnection, d *schema.ResourceData) error {
+	return resourcePostgreSQLDatabaseCreate(db, d)
 }
 
 func resourcePostgreSQLGrantDelete(db *DBConnection, d *schema.ResourceData) error {
@@ -755,19 +795,29 @@ func checkRoleDBSchemaExists(client *Client, d *schema.ResourceData) (bool, erro
 }
 
 func generateGrantID(d *schema.ResourceData) string {
-	parts := []string{d.Get("role").(string), d.Get("database").(string)}
+	return generateGrantIDImpl(
+		d.Get("role").(string),
+		d.Get("database").(string),
+		d.Get("object_type").(string),
+		d.Get("schema").(string),
+		d.Get("objects").(*schema.Set),
+		d.Get("columns").(*schema.Set),
+	)
+}
 
-	objectType := d.Get("object_type").(string)
+func generateGrantIDImpl(role string, database string, objectType string, schema string, objects *schema.Set, columns *schema.Set) string {
+	parts := []string{role, database}
+
 	if objectType != "database" && objectType != "foreign_data_wrapper" && objectType != "foreign_server" {
-		parts = append(parts, d.Get("schema").(string))
+		parts = append(parts, schema)
 	}
 	parts = append(parts, objectType)
 
-	for _, object := range d.Get("objects").(*schema.Set).List() {
+	for _, object := range objects.List() {
 		parts = append(parts, object.(string))
 	}
 
-	for _, column := range d.Get("columns").(*schema.Set).List() {
+	for _, column := range columns.List() {
 		parts = append(parts, column.(string))
 	}
 
